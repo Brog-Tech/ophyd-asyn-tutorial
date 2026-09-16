@@ -8,6 +8,7 @@ from math import isclose
 from typing import Annotated as A
 from typing import ClassVar
 from bisect import bisect
+from time import perf_counter
 
 
 import bluesky.plan_stubs as bps
@@ -67,12 +68,18 @@ class LakeShore336LoopLogic(MovableLogic[float]):
     tolerance: float
     settle_time: float
     move_timeout: float
-    p: int
-    i: int
-    d: int
-    ramp: float
+    p: SignalRW[float]
+    i: SignalRW[float]
+    d: SignalRW[float]
+    ramp: SignalRW[float]
 
     delta = None
+
+    async def check_move(self, new_position):
+        if new_position < 5:
+            raise ValueError
+        elif new_position > 550:
+            raise ValueError
 
     async def delta_t(
         self,
@@ -80,6 +87,29 @@ class LakeShore336LoopLogic(MovableLogic[float]):
         new_position: float,
     ) -> None:
         self.delta = new_position - old_position
+
+    async def set_pids(
+        self,
+        new_position: float
+    ) -> None:
+
+        if self.delta > .5:
+            temp_thresholds = [140,270,300]
+            pids = [(50,10,1),(25,6,3),(26,5,3),(26,5,3)]
+
+        elif self.delta < -.5:
+            temp_thresholds = [140,200]
+            pids = [(25,4,3),(25,6,3),(35,8,3)]
+
+        else:
+            return
+
+        pid_selector = bisect(temp_thresholds,new_position)
+        _p,_i,_d = pids[pid_selector]
+
+        await self.p.set(_p)
+        await self.i.set(_i)
+        await self.d.set(_d)        
 
     async def calculate_timeout(
         self,
@@ -89,12 +119,15 @@ class LakeShore336LoopLogic(MovableLogic[float]):
 
         await self.delta_t(old_position,new_position)
         print(f"Delta = {self.delta}")
+
+        await self.set_pids(new_position)
+
         ramp_rate = await self.ramp.get_value()  # perhaps degrees/minute
 
         if ramp_rate == 0:
             ramp_rate = .015 # K/s
 
-        travel_time = abs(new_position - old_position) / ramp_rate * 60
+        travel_time = abs(self.delta) / ramp_rate * 60
         print(f"{travel_time + self.settle_time + 30} Seconds to complete the temp change")
         return travel_time + self.settle_time + 30
 
@@ -102,6 +135,8 @@ class LakeShore336LoopLogic(MovableLogic[float]):
         self, new_position: float, timeout: TimeoutCalculator
         ) -> None:
         """Write the setpoint and wait for readback to settle around it."""
+
+        start_time = perf_counter
 
         original_temp = await self.readback.get_value()
         new_temp = await self.setpoint.get_value()
@@ -131,7 +166,8 @@ class LakeShore336LoopLogic(MovableLogic[float]):
         # Subscribe before writing so that a fast readback update cannot be missed.
         self.readback.subscribe_reading(update_settled_state)
         try:
-            await self.setpoint.set(new_position, timeout=timeout())
+            # await self.setpoint.set(new_position, timeout=timeout())
+            await self.setpoint.set(new_position)
             async with asyncio.timeout(timeout()):
                 await settled.wait()
         finally:
